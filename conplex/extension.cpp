@@ -44,8 +44,12 @@ bool shouldHandleProcessAccept;
 
 // Old engines (Source 2006 / Ep1, e.g. Neotokyo) have no CSocketCreator. The RCON
 // listen socket and its accepted-socket list live directly inside CRConServer, and
-// the detoured ProcessAccept is CRConServer::ProcessAccept. Enabled from gamedata:
-//   "Keys"    { "SocketLayout" "RConServer" }
+// the detoured ProcessAccept is CRConServer::ProcessAccept.
+// The layout is detected at load time (see SDK_OnLoad): if the 2013-style "ProcessAccept"
+// signature resolves the classic CSocketCreator path is used, otherwise if
+// "RConServer_ProcessAccept" resolves this mode is used. It can be forced per game with
+//   "Keys"    { "SocketLayout" "RConServer" }   (or "SocketCreator")
+// and the listen socket position overridden with
 //   "Offsets" { "RConListenSocket" { "windows" "0" } }
 bool rconServerMode = false;
 int rconListenSocketOffset = 0;
@@ -759,6 +763,13 @@ sp_nativeinfo_t natives[] = {
 	{NULL, NULL}
 };
 
+// True if the signature exists in gamedata for this platform and was found in memory.
+static bool SignatureResolves(const char *name)
+{
+	void *address = NULL;
+	return gameConfig->GetMemSig(name, &address) && address != NULL;
+}
+
 bool Conplex::SDK_OnLoad(char *error, size_t maxlength, bool late)
 {
 	if (!sharesys->AddInterface(myself, this))
@@ -771,8 +782,33 @@ bool Conplex::SDK_OnLoad(char *error, size_t maxlength, bool late)
 		return false;
 	}
 
+	// Work out which engine socket layout we're on.
+	//   Source 2007+ (incl. 2013, CS:GO, L4D2): CSocketCreator::ProcessAccept -> "ProcessAccept"
+	//   Source 2006 / Ep1 (Neotokyo etc.):      CRConServer::ProcessAccept    -> "RConServer_ProcessAccept"
+	// The two signatures are for different functions, so at most one of them should match a given engine.
+	const char *processAcceptName = "ProcessAccept";
+	const char *handleFailedRconAuthName = "HandleFailedRconAuth";
+
 	const char *socketLayout = gameConfig->GetKeyValue("SocketLayout");
-	rconServerMode = (socketLayout && strcmp(socketLayout, "RConServer") == 0);
+	if (socketLayout && strcmp(socketLayout, "RConServer") == 0) {
+		rconServerMode = true;
+	} else if (socketLayout && strcmp(socketLayout, "SocketCreator") == 0) {
+		rconServerMode = false;
+	} else {
+		rconServerMode = !SignatureResolves("ProcessAccept") && SignatureResolves("RConServer_ProcessAccept");
+	}
+
+	if (rconServerMode) {
+		// Prefer the dedicated 2006 names; fall back to the generic ones so a per-game section can use either.
+		if (SignatureResolves("RConServer_ProcessAccept")) {
+			processAcceptName = "RConServer_ProcessAccept";
+		}
+		if (SignatureResolves("RConServer_HandleFailedRconAuth")) {
+			handleFailedRconAuthName = "RConServer_HandleFailedRconAuth";
+		}
+	}
+
+	smutils->LogMessage(myself, "Engine socket layout: %s", rconServerMode ? "RConServer (Source 2006)" : "CSocketCreator (Source 2007+)");
 
 	if (rconServerMode) {
 #ifdef _WIN32
@@ -794,7 +830,7 @@ bool Conplex::SDK_OnLoad(char *error, size_t maxlength, bool late)
 
 	CDetourManager::Init(smutils->GetScriptingEngine(), gameConfig);
 
-	detourProcessAccept = DETOUR_CREATE_MEMBER(ProcessAccept, "ProcessAccept");
+	detourProcessAccept = DETOUR_CREATE_MEMBER(ProcessAccept, processAcceptName);
 	if (!detourProcessAccept) {
 		strncpy(error, "Error setting up ProcessAccept detour", maxlength);
 #ifdef _WIN32
@@ -813,7 +849,7 @@ bool Conplex::SDK_OnLoad(char *error, size_t maxlength, bool late)
 		smutils->LogError(myself, "WARNING: Error setting up RunFrame detour, all TCP sockets will be hooked.");
 	}
 
-	if (!gameConfig->GetMemSig("HandleFailedRconAuth", &CRConServer::HandleFailedRconAuthFunction)) {
+	if (!gameConfig->GetMemSig(handleFailedRconAuthName, &CRConServer::HandleFailedRconAuthFunction)) {
 		smutils->LogError(myself, "WARNING: HandleFailedRconAuth not found in gamedata, bad clients will not be banned.");
 	} else if (!CRConServer::HandleFailedRconAuthFunction) {
 		smutils->LogError(myself, "WARNING: Scan for HandleFailedRconAuth failed, bad clients will not be banned.");
