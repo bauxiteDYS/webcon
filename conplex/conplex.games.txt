@@ -161,6 +161,50 @@
 		}
 	}
 
+	/*
+	 * Neotokyo (Source 2006 / Ep1 engine). There is no CSocketCreator in this engine branch:
+	 * CRConServer owns the listen socket itself (at offset 0) and ProcessAccept is a CRConServer method.
+	 * ProcessAccept string:        "RCON Server ProcessAccept Error: %s"
+	 * RunFrame (unused here):      the function that calls ProcessAccept, checks [this] != -1 first
+	 * HandleFailedRconAuth string: "Banning %s for rcon hacking attempts"
+	 */
+	"NeotokyoSource"
+	{
+		"Keys"
+		{
+			"SocketLayout"	"RConServer"
+		}
+
+		"Offsets"
+		{
+			"RConListenSocket"
+			{
+				"windows"	"0"
+			}
+		}
+
+		"Signatures"
+		{
+			"ProcessAccept"
+			{
+				"library" "engine"
+				"windows" "\x83\xEC\x14\x56\x57\x8B\xF1\x8B\x16\x8D\x44\x24\x08\x50\x8D\x4C\x24\x10\x51\x52\xC7\x44\x24\x14\x10\x00\x00\x00"
+			}
+
+			"RunFrame"
+			{
+				"library" "engine"
+				"windows" "\x55\x8B\xEC\x6A\xFF\x68\x2A\x2A\x2A\x2A\x64\xA1\x00\x00\x00\x00\x50\xB8\x54\x10\x00\x00\x64\x89\x25\x00\x00\x00\x00\xE8\x2A\x2A\x2A\x2A\x53\x56\x8B\xF1\x83\x3E\xFF"
+			}
+
+			"HandleFailedRconAuth"
+			{
+				"library" "engine"
+				"windows" "\x51\x53\x55\x56\x57\x8B\xF1\x33\xFF\x39\x7E\x34\x7E\x2A\x33\xDB\x8B\x46\x28\x8B\x4C\x24\x18\x6A\x01"
+			}
+		}
+	}
+
 	"left4dead2"
 	{
 		"Signatures"
