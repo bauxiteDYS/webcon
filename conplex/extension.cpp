@@ -8,6 +8,7 @@
 #include <io.h>
 #include <Winsock2.h>
 #include <Ws2tcpip.h>
+#include <windows.h>
 #else
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -40,6 +41,98 @@ SMEXT_LINK(&g_Conplex);
 IGameConfig *gameConfig;
 
 bool shouldHandleProcessAccept;
+
+// Old engines (Source 2006 / Ep1, e.g. Neotokyo) have no CSocketCreator. The RCON
+// listen socket and its accepted-socket list live directly inside CRConServer, and
+// the detoured ProcessAccept is CRConServer::ProcessAccept. Enabled from gamedata:
+//   "Keys"    { "SocketLayout" "RConServer" }
+//   "Offsets" { "RConListenSocket" { "windows" "0" } }
+bool rconServerMode = false;
+int rconListenSocketOffset = 0;
+void *engineRConServer = NULL;
+
+#ifdef _WIN32
+// To hand an RCON connection back to an old engine we call the original
+// CRConServer::ProcessAccept with engine.dll's accept() import redirected so it
+// returns the socket we already accepted. The engine then does all of its own
+// bookkeeping, so no struct layouts need to be known.
+typedef SOCKET (WSAAPI *AcceptFunc)(SOCKET, sockaddr *, int *);
+AcceptFunc realEngineAccept = NULL;
+void **engineAcceptSlot = NULL;
+SOCKET injectedSocket = INVALID_SOCKET;
+sockaddr injectedAddress;
+int injectedAddressLength = 0;
+
+SOCKET WSAAPI EngineAcceptHook(SOCKET s, sockaddr *addr, int *addrlen)
+{
+	if (injectedSocket != INVALID_SOCKET) {
+		SOCKET ret = injectedSocket;
+		injectedSocket = INVALID_SOCKET;
+
+		if (addr && addrlen) {
+			int len = (*addrlen < injectedAddressLength) ? *addrlen : injectedAddressLength;
+			memcpy(addr, &injectedAddress, len);
+			*addrlen = injectedAddressLength;
+		}
+
+		return ret;
+	}
+
+	return realEngineAccept(s, addr, addrlen);
+}
+
+bool PatchEngineAcceptImport(bool install)
+{
+	if (!install) {
+		if (engineAcceptSlot && realEngineAccept) {
+			DWORD old;
+			VirtualProtect(engineAcceptSlot, sizeof(void *), PAGE_READWRITE, &old);
+			*engineAcceptSlot = (void *)realEngineAccept;
+			VirtualProtect(engineAcceptSlot, sizeof(void *), old, &old);
+		}
+		engineAcceptSlot = NULL;
+		return true;
+	}
+
+	unsigned char *base = (unsigned char *)GetModuleHandleA("engine.dll");
+	if (!base) return false;
+
+	IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+	IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+	IMAGE_DATA_DIRECTORY &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	if (!dir.VirtualAddress) return false;
+
+	for (IMAGE_IMPORT_DESCRIPTOR *imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress); imp->Name; ++imp) {
+		const char *dll = (const char *)(base + imp->Name);
+		if (_stricmp(dll, "wsock32.dll") != 0 && _stricmp(dll, "ws2_32.dll") != 0) continue;
+
+		IMAGE_THUNK_DATA *names = (IMAGE_THUNK_DATA *)(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+		IMAGE_THUNK_DATA *slots = (IMAGE_THUNK_DATA *)(base + imp->FirstThunk);
+
+		for (; names->u1.AddressOfData; ++names, ++slots) {
+			bool isAccept;
+			if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) {
+				isAccept = (IMAGE_ORDINAL(names->u1.Ordinal) == 1); // accept is ordinal 1 in both wsock32 and ws2_32
+			} else {
+				IMAGE_IMPORT_BY_NAME *byName = (IMAGE_IMPORT_BY_NAME *)(base + names->u1.AddressOfData);
+				isAccept = (strcmp((const char *)byName->Name, "accept") == 0);
+			}
+			if (!isAccept) continue;
+
+			engineAcceptSlot = (void **)&slots->u1.Function;
+			realEngineAccept = (AcceptFunc)*engineAcceptSlot;
+
+			DWORD old;
+			VirtualProtect(engineAcceptSlot, sizeof(void *), PAGE_READWRITE, &old);
+			*engineAcceptSlot = (void *)&EngineAcceptHook;
+			VirtualProtect(engineAcceptSlot, sizeof(void *), old, &old);
+			return true;
+		}
+	}
+
+	return false;
+}
+#endif
 
 CDetour *detourProcessAccept;
 CDetour *detourRunFrame;
@@ -293,7 +386,14 @@ struct CSocketCreator
 
 CSocketCreator *socketCreator;
 
+void AcceptIntoPending(int listenSocket, ISocketCreatorListener *listener);
+
 void CSocketCreator::ProcessAccept()
+{
+	AcceptIntoPending(listenSocket, listener);
+}
+
+void AcceptIntoPending(int listenSocket, ISocketCreatorListener *listener)
 {
 	sockaddr socketAddress;
 	socklen_t socketAddressLength = sizeof(socketAddress);
@@ -367,10 +467,17 @@ DETOUR_DECL_MEMBER0(ProcessAccept, void)
 		return DETOUR_MEMBER_CALL(ProcessAccept)();
 	}
 
-	socketCreator = (CSocketCreator *)this;
-
 	// Check for incoming sockets first.
-	socketCreator->ProcessAccept();
+	if (rconServerMode) {
+		// 'this' is a CRConServer, not a CSocketCreator.
+		engineRConServer = this;
+		rconServer = (CRConServer *)this;
+		int listenSocket = *(int *)((unsigned char *)this + rconListenSocketOffset);
+		AcceptIntoPending(listenSocket, NULL);
+	} else {
+		socketCreator = (CSocketCreator *)this;
+		socketCreator->ProcessAccept();
+	}
 
 	unsigned char buffer[32] = {};
 
@@ -505,6 +612,31 @@ IConplex::ProtocolDetectionState ConplexRConDetector(const char *id, const unsig
 
 bool ConplexRConHandler(const char *id, int socket, const sockaddr *address, unsigned int addressLength)
 {
+	if (rconServerMode) {
+#ifdef _WIN32
+		if (!engineRConServer || !engineAcceptSlot) {
+			return false;
+		}
+
+		injectedSocket = (SOCKET)socket;
+		injectedAddressLength = (addressLength < sizeof(injectedAddress)) ? addressLength : sizeof(injectedAddress);
+		memcpy(&injectedAddress, address, injectedAddressLength);
+
+		// Run the engine's own (un-detoured) accept path; its accept() call gets our socket.
+		(((ProcessAcceptClass *)engineRConServer)->*(ProcessAcceptClass::ProcessAccept_Actual))();
+
+		if (injectedSocket != INVALID_SOCKET) {
+			// Engine bailed out before calling accept(); let the caller close it.
+			injectedSocket = INVALID_SOCKET;
+			return false;
+		}
+
+		return true;
+#else
+		return false;
+#endif
+	}
+
 	if (!socketCreator) {
 		return false;
 	}
@@ -639,17 +771,44 @@ bool Conplex::SDK_OnLoad(char *error, size_t maxlength, bool late)
 		return false;
 	}
 
+	const char *socketLayout = gameConfig->GetKeyValue("SocketLayout");
+	rconServerMode = (socketLayout && strcmp(socketLayout, "RConServer") == 0);
+
+	if (rconServerMode) {
+#ifdef _WIN32
+		if (!gameConfig->GetOffset("RConListenSocket", &rconListenSocketOffset)) {
+			rconListenSocketOffset = 0;
+		}
+
+		if (!PatchEngineAcceptImport(true)) {
+			strncpy(error, "SocketLayout RConServer: could not find accept() import in engine.dll", maxlength);
+			gameconfs->CloseGameConfigFile(gameConfig);
+			return false;
+		}
+#else
+		strncpy(error, "SocketLayout RConServer is only implemented on Windows", maxlength);
+		gameconfs->CloseGameConfigFile(gameConfig);
+		return false;
+#endif
+	}
+
 	CDetourManager::Init(smutils->GetScriptingEngine(), gameConfig);
 
 	detourProcessAccept = DETOUR_CREATE_MEMBER(ProcessAccept, "ProcessAccept");
 	if (!detourProcessAccept) {
 		strncpy(error, "Error setting up ProcessAccept detour", maxlength);
+#ifdef _WIN32
+		PatchEngineAcceptImport(false);
+#endif
 		gameconfs->CloseGameConfigFile(gameConfig);
 		return false;
 	}
 
-	detourRunFrame = DETOUR_CREATE_MEMBER(RunFrame, "RunFrame");
-	if (!detourRunFrame) {
+	// In RConServer layout ProcessAccept only ever serves RCON, so no scoping detour is needed.
+	detourRunFrame = rconServerMode ? NULL : DETOUR_CREATE_MEMBER(RunFrame, "RunFrame");
+	if (rconServerMode) {
+		shouldHandleProcessAccept = true;
+	} else if (!detourRunFrame) {
 		shouldHandleProcessAccept = true;
 		smutils->LogError(myself, "WARNING: Error setting up RunFrame detour, all TCP sockets will be hooked.");
 	}
@@ -684,6 +843,12 @@ void Conplex::SDK_OnUnload()
 	}
 
 	detourProcessAccept->DisableDetour();
+
+#ifdef _WIN32
+	if (rconServerMode) {
+		PatchEngineAcceptImport(false);
+	}
+#endif
 
 	gameconfs->CloseGameConfigFile(gameConfig);
 }
